@@ -1,10 +1,69 @@
 "use client";
 
 import { useState } from "react";
-import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
-import { storage } from "@/lib/firebase";
 
 const CATEGORIES = ["E-Cycle", "E-Scooter", "E-Bike", "E-Rickshaw"];
+
+// Helper function to compress images before uploading
+const compressImage = (file, maxWidth = 1200, maxHeight = 1200, quality = 0.8) => {
+  return new Promise((resolve) => {
+    // Only compress images
+    if (!file.type.startsWith("image/")) {
+      resolve(file);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target.result;
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        // Calculate aspect ratio resizing
+        if (width > height) {
+          if (width > maxWidth) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          }
+        } else {
+          if (height > maxHeight) {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              resolve(file);
+              return;
+            }
+            // Create a compressed File object with same name
+            const compressedFile = new File([blob], file.name, {
+              type: "image/jpeg",
+              lastModified: Date.now(),
+            });
+            resolve(compressedFile);
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = () => resolve(file);
+    };
+    reader.onerror = () => resolve(file);
+  });
+};
 
 export default function ProductForm() {
   const [formData, setFormData] = useState({
@@ -35,7 +94,7 @@ export default function ProductForm() {
     }));
   };
 
-  const handleImageUpload = (e) => {
+  const handleImageUpload = async (e) => {
     const files = Array.from(e.target.files);
     if (files.length === 0) return;
 
@@ -43,48 +102,61 @@ export default function ProductForm() {
     setError("");
     setUploadProgress({});
 
-    const uploadPromises = files.map((file) => {
-      return new Promise((resolve, reject) => {
-        const timestamp = Date.now();
-        const cleanFileName = file.name.replace(/[^a-zA-Z0-9.]/g, "_");
-        const storageRef = ref(storage, `products/${timestamp}_${cleanFileName}`);
-        const uploadTask = uploadBytesResumable(storageRef, file);
+    try {
+      // Compress all images in parallel
+      const compressedFiles = await Promise.all(
+        files.map((file) => compressImage(file))
+      );
 
-        uploadTask.on(
-          "state_changed",
-          (snapshot) => {
-            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-            setUploadProgress((prev) => ({
-              ...prev,
-              [file.name]: Math.round(progress),
-            }));
-          },
-          (error) => {
-            console.error("Upload error: ", error);
-            reject(error);
-          },
-          async () => {
-            try {
-              const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-              resolve(downloadURL);
-            } catch (err) {
-              reject(err);
+      const uploadPromises = compressedFiles.map((file) => {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", "https://api.cloudinary.com/v1_1/dj8rbm4e5/image/upload");
+
+          // Track progress
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) {
+              const progress = Math.round((event.loaded / event.total) * 100);
+              setUploadProgress((prev) => ({
+                ...prev,
+                [file.name]: progress,
+              }));
             }
-          }
-        );
-      });
-    });
+          };
 
-    Promise.all(uploadPromises)
-      .then((urls) => {
-        setImages((prev) => [...prev, ...urls]);
-        setUploading(false);
-      })
-      .catch((err) => {
-        console.error(err);
-        setError("Failed to upload some images. Please try again.");
-        setUploading(false);
+          // On success/failure
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const response = JSON.parse(xhr.responseText);
+                resolve(response.secure_url);
+              } catch (err) {
+                reject(new Error("Failed to parse response"));
+              }
+            } else {
+              reject(new Error(`Failed with status ${xhr.status}`));
+            }
+          };
+
+          xhr.onerror = () => {
+            reject(new Error("Network error during upload"));
+          };
+
+          const formDataToSend = new FormData();
+          formDataToSend.append("file", file);
+          formDataToSend.append("upload_preset", "ico9jorm");
+          xhr.send(formDataToSend);
+        });
       });
+
+      const urls = await Promise.all(uploadPromises);
+      setImages((prev) => [...prev, ...urls]);
+      setUploading(false);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to upload some images. Please try again.");
+      setUploading(false);
+    }
   };
 
   const handleRemoveImage = (indexToRemove) => {
